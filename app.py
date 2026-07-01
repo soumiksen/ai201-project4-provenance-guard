@@ -1,8 +1,9 @@
 """
 Provenance Guard — Flask app.
 
-Milestone 4 scope: two detection signals combined into a single weighted
-confidence score, wired to a structured, append-only audit log.
+Milestone 5 scope: the full production layer on top of the Milestone 4
+detection pipeline - transparency labels, an appeals workflow, rate
+limiting, and a complete audit log.
 """
 
 import os
@@ -16,13 +17,28 @@ from flask_limiter.util import get_remote_address
 from signal_1_llm import signal_1_score
 from signal_2_stylometric import signal_2_stylometric
 from confidence import combine_signals
-from audit_log import append_entry, get_recent
+from labels import generate_label
+from audit_log import append_entry, update_entry, get_recent, get_by_content_id
 
 app = Flask(__name__)
-limiter = Limiter(get_remote_address, app=app, default_limits=["60 per minute"])
+
+# Rate limiting reasoning (documented in full in README.md):
+# - /submit: "10 per minute; 100 per day" - generous enough for a writer
+#   submitting several drafts in a working session (1 every ~6 seconds),
+#   while a flooding script hits the ceiling almost immediately.
+# - default_limits left empty; each route sets its own explicit limit so
+#   the reasoning per-route is visible at the decorator, not buried in a
+#   global default.
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
+
 
 @app.route("/submit", methods=["POST"])
-@limiter.limit("20 per minute")
+@limiter.limit("10 per minute;100 per day")
 def submit():
     data = request.get_json(silent=True) or {}
     text = data.get("text")
@@ -42,6 +58,7 @@ def submit():
     combined = combine_signals(signal_1["llm_score"], signal_2["stylometric_score"])
     confidence = combined["confidence"]
     attribution = combined["attribution"]
+    label = generate_label(confidence)
 
     entry = {
         "content_id": content_id,
@@ -54,7 +71,9 @@ def submit():
         "stylometric_score": signal_2["stylometric_score"],
         "sentence_length_cv": signal_2["sentence_length_cv"],
         "type_token_ratio": signal_2["type_token_ratio"],
+        "label_headline": label["headline"],
         "status": "classified",
+        "appeal_filed": False,
     }
     append_entry(entry)
 
@@ -62,10 +81,45 @@ def submit():
         "content_id": content_id,
         "attribution": attribution,
         "confidence": confidence,
+        "label": {
+            "headline": label["headline"],
+            "subtext": label["subtext"],
+        },
         "signals": {
             "llm_score": signal_1["llm_score"],
             "stylometric_score": signal_2["stylometric_score"],
         },
+    }), 201
+
+
+@app.route("/appeal", methods=["POST"])
+@limiter.limit("10 per minute")
+def appeal():
+    data = request.get_json(silent=True) or {}
+    content_id = data.get("content_id")
+    creator_reasoning = data.get("creator_reasoning")
+
+    if not content_id:
+        return jsonify({"error": "'content_id' is required"}), 400
+    if not creator_reasoning or not isinstance(creator_reasoning, str) or not creator_reasoning.strip():
+        return jsonify({"error": "'creator_reasoning' is required and must be a non-empty string"}), 400
+
+    existing = get_by_content_id(content_id)
+    if not existing:
+        return jsonify({"error": f"no submission found with content_id '{content_id}'"}), 404
+
+    appeal_timestamp = datetime.now(timezone.utc).isoformat()
+    updated = update_entry(content_id, {
+        "status": "under_review",
+        "appeal_filed": True,
+        "appeal_reasoning": creator_reasoning,
+        "appeal_timestamp": appeal_timestamp,
+    })
+
+    return jsonify({
+        "content_id": content_id,
+        "status": updated["status"],
+        "message": "Appeal received and logged. This submission is now under review.",
     }), 201
 
 
