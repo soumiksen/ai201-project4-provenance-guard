@@ -1,113 +1,122 @@
-# Provenance Guard — Milestone 1: Architecture Plan
+# Provenance Guard — planning.md
 
-## 1. Architecture Narrative
+## 1. Detection Signals
 
-This is the path a single piece of submitted text takes from arrival to the label a user sees.
+Two signals, each normalized to a **0.0–1.0 float**, where **1.0 = strongly AI-like** and **0.0 = strongly human-like**. Raw, unnormalized scores are never shown to users or combined directly — normalization keeps both signals on the same scale before they're combined.
 
-1. **Client** sends the raw text to the API via `POST /submit`.
-2. **Ingestion layer** validates the payload (non-empty, under max length, supported language) and assigns a `submission_id`.
-3. **Signal 1: Perplexity Scorer** runs the text through a reference language model and computes how statistically predictable the word choices are. It outputs a raw score (e.g. average log-probability per token).
-4. **Signal 2: Burstiness Analyzer** measures sentence-length and syntactic variance across the text. It outputs a raw score (e.g. coefficient of variation of sentence length).
-5. **Confidence Scoring component** normalizes both raw signal scores to a common 0–1 scale and combines them (weighted average) into a single `confidence_score`, representing the system's confidence that the text is AI-generated.
-6. **Transparency Label Generator** maps the confidence score to a human-readable label (e.g. "Likely Human," "Uncertain," "Likely AI-Assisted," "Likely AI-Generated") and attaches the underlying signal breakdown so the label is explainable, not just a verdict.
-7. **Audit Log component** writes an immutable record: submission_id, timestamp, raw signal scores, combined confidence, and final label.
-8. **Response** is returned to the client: `submission_id`, `label`, `confidence_score`, and a breakdown of both signals.
+### Signal 1 — Perplexity Score
+- **Measures:** how statistically predictable the text's word choices are under a reference language model (e.g. GPT-2 small via `transformers`, chosen for being small enough to run without a GPU).
+- **Raw output:** average per-token log-probability (a negative float, less negative = more predictable).
+- **Normalization:** raw perplexity is min-max scaled against a fixed calibration corpus (50 known-human / 50 known-AI samples collected up front) into `perplexity_score ∈ [0, 1]`, where 1.0 = most predictable (AI-like) and 0.0 = least predictable (human-like).
 
-If the creator disputes the label, they call `POST /appeal` with the `submission_id` and their reasoning. The **Appeal Handler** looks up the original submission, updates its status (e.g. "Under Review" → "Resolved"), and writes a new entry to the same audit log tied to the original `submission_id`, preserving the full history. The response confirms the appeal was received and its current status.
+### Signal 2 — Burstiness Score
+- **Measures:** uniformity of sentence length and structure across the document.
+- **Raw output:** coefficient of variation (stdev / mean) of sentence lengths, in tokens.
+- **Normalization:** `burstiness_score = 1 - normalized_CV`, scaled against the same calibration corpus, so 1.0 = highly uniform sentences (AI-like) and 0.0 = highly varied sentence rhythm (human-like).
 
-**Components touched, end to end:** Client → Ingestion Layer → Signal 1 (Perplexity Scorer) → Signal 2 (Burstiness Analyzer) → Confidence Scoring → Transparency Label Generator → Audit Log → Response. Appeals touch: Client → Appeal Handler → Audit Log (append) → Response.
-
----
-
-## 2. Detection Signals
-
-### Signal 1: Perplexity (predictability under a reference language model)
-
-- **What it measures:** How statistically "expected" each word is, given the words before it, according to a language model. Low perplexity = very predictable text; high perplexity = more surprising word choices.
-- **Why it differs human vs. AI:** AI text generation is explicitly optimized to pick high-probability continuations, so generated text tends to cluster at low perplexity. Human writing tends to include idiosyncratic phrasing, tangents, and less "optimal" word choices, pushing perplexity higher.
-- **Blind spot:** Human writers with a plain, formulaic, or highly technical style (legal boilerplate, simple non-native-speaker prose, children's writing) can also score as low-perplexity, causing false positives. Conversely, AI text that has been heavily human-edited or generated with high "temperature" can score higher and evade detection.
-
-### Signal 2: Burstiness (sentence-level structural variance)
-
-- **What it measures:** The variation in sentence length and syntactic structure across a document — how "bursty" or uneven the rhythm of the writing is.
-- **Why it differs human vs. AI:** Human writing naturally oscillates between short and long sentences, fragments, and structural styles. AI-generated text tends to produce more uniform sentence lengths and repetitive structural patterns unless explicitly prompted otherwise.
-- **Blind spot:** Short-form or highly structured human writing (technical documentation, academic abstracts, news ledes) is naturally low-burstiness and can be misflagged. AI text prompted with instructions like "vary sentence length" or lightly rewritten by a human can mimic natural burstiness and evade detection.
-
-**Why two signals instead of one:** each signal's blind spot is roughly the *opposite* case where the other signal's blind spot occurs (formulaic human writing vs. stylistically-instructed AI text), so combining them into a single confidence score is more robust than relying on either alone — though neither eliminates false positives entirely, which is why the confidence score and appeal path both exist.
+### Combining into a single confidence score
+```
+confidence_score = (w1 * perplexity_score) + (w2 * burstiness_score)
+w1 = 0.5, w2 = 0.5   # equal weight by default; tunable constants, not hardcoded inline
+```
+`confidence_score` is a float in `[0, 1]`. It is **not** a calibrated probability in the statistical sense — it's a weighted blend of two heuristic signals — and the system must never present it to users as "there is an X% chance this is AI," only as a relative confidence level (see Section 3).
 
 ---
 
-## 3. False Positive Scenario Walkthrough
+## 2. Uncertainty Representation
 
-**Scenario:** A non-native English speaker writes a technical status report. Their sentences are short, uniform in length, and use predictable, plain vocabulary — a writing style that happens to overlap with both signals' AI-like patterns.
+A `confidence_score` of **0.6** means: the blended signal evidence leans toward AI-generated, but not strongly enough to be conclusive — it sits in the band where the system should communicate doubt rather than a verdict.
 
-1. Signal 1 (perplexity) returns a low score → looks AI-like.
-2. Signal 2 (burstiness) returns a low score → also looks AI-like.
-3. Confidence Scoring combines these into a moderately high `confidence_score` (e.g. 0.72) — high, but not maximal, since both signals are individually weak indicators, not proof.
-4. Transparency Label Generator assigns "Likely AI-Assisted" rather than "Likely AI-Generated," and — critically — surfaces the signal breakdown and the confidence score itself, not just a flat verdict. The label is designed to communicate *uncertainty*, not a definitive accusation.
-5. Audit Log records the full basis for the decision (both raw scores, the combination, and the label).
-6. The creator sees the label, disagrees, and calls `POST /appeal` with an explanation (e.g. "I'm a non-native speaker; this is my normal writing style," possibly with supporting samples of their prior writing).
-7. Appeal Handler updates the submission's status to "Under Review," and — depending on scope — either flags it for human review or reruns scoring with the additional context. The outcome (e.g. label revised to "Uncertain" or upheld) is appended to the audit log against the original `submission_id`.
-8. The response to the appeal includes the updated status and a note on how to check it again (`GET /appeal/{id}`).
+**Thresholds** (tunable constants, not magic numbers scattered in code):
+| Range | Meaning |
+|---|---|
+| `0.00 – 0.34` | Likely Human |
+| `0.35 – 0.65` | Uncertain |
+| `0.66 – 1.00` | Likely AI-Generated |
 
-**Design implication carried into Milestone 2:** the confidence score must always be shown alongside the label (never a bare true/false verdict), and the appeal flow must preserve — not overwrite — the original decision in the audit log, so the full history is inspectable.
+The band boundaries are deliberately **not** a binary split at 0.5 — the middle third of the range is reserved for "Uncertain" on purpose, because both signals have known blind spots (Section 4) and collapsing everything into a two-way AI/human split would overstate the system's certainty. Every response includes the raw `confidence_score` alongside the label, never the label alone, so a user (or downstream reviewer) can see how close to a boundary a given result sits.
 
 ---
 
-## 4. API Surface (sketch)
+## 3. Transparency Label Design
 
-| Endpoint | Accepts | Returns |
-|---|---|---|
-| `POST /submit` | `{ text: string, author_id?: string }` | `{ submission_id, label, confidence_score, signals: { perplexity, burstiness } }` |
-| `GET /submission/{submission_id}` | — | `{ submission_id, label, confidence_score, signals, status, created_at }` |
-| `POST /appeal` | `{ submission_id: string, reason: string, evidence?: string }` | `{ appeal_id, submission_id, status: "under_review", created_at }` |
-| `GET /appeal/{appeal_id}` | — | `{ appeal_id, submission_id, status, resolution?, resolved_at? }` |
-| `GET /audit-log/{submission_id}` | — | `{ submission_id, entries: [ { event_type, timestamp, data } ] }` |
+Exact label text, written now so the UI has a fixed contract to build against:
 
-This is the contract every other component is built against — signal implementations, scoring logic, and storage can all change internally as long as they honor these shapes.
+- **High-confidence AI** (`confidence_score` 0.66–1.00):
+  `"⚠️ Likely AI-Generated (confidence: {score})"` — subtext: `"This text shows patterns consistent with AI generation: predictable word choices and uniform sentence structure."`
+
+- **Uncertain** (`confidence_score` 0.35–0.65):
+  `"❓ Uncertain (confidence: {score})"` — subtext: `"Signals are mixed. This text has some characteristics of both AI-generated and human-written content."`
+
+- **High-confidence human** (`confidence_score` 0.00–0.34):
+  `"✅ Likely Human-Written (confidence: {score})"` — subtext: `"This text shows patterns typical of human writing: varied sentence structure and less predictable word choices."`
+
+Every label always renders with its numeric confidence score and its subtext — the label word alone is never shown without the supporting context, to avoid presenting a heuristic guess as a fact.
 
 ---
 
-## 5. Diagram
+## 4. Appeals Workflow
 
-```mermaid
-flowchart TD
-    subgraph Submission Flow
-        A[Client] -->|POST /submit: raw text| B[Ingestion Layer]
-        B -->|text| C[Signal 1: Perplexity Scorer]
-        C -->|perplexity score| D[Signal 2: Burstiness Analyzer]
-        B -->|text| D
-        C -->|perplexity score| E[Confidence Scoring]
-        D -->|burstiness score| E
-        E -->|combined confidence_score| F[Transparency Label Generator]
-        F -->|label + confidence + signals| G[Audit Log]
-        F -->|label + confidence + signals| H[Response to Client]
-    end
+- **Who can appeal:** the original submitter (`author_id` on the submission). No third party can appeal on someone else's behalf.
+- **What they provide:** `submission_id`, a free-text `reason`, and an optional `evidence` field (e.g. links to other writing samples, an explanation of writing context/disability/non-native-speaker status).
+- **What happens on receipt:**
+  1. The original submission's `status` changes from `finalized` → `under_review`.
+  2. A new entry is appended to that submission's audit log: `{ event_type: "appeal_filed", timestamp, reason, evidence }`. The original scoring entry is never edited or deleted — only appended to.
+  3. The appeal enters a review queue for human resolution.
+- **What a human reviewer sees when they open the appeal queue:** a list of pending appeals, each showing the original submitted text, the full signal breakdown (`perplexity_score`, `burstiness_score`, `confidence_score`), the original label, the appeal `reason` and `evidence`, and two actions: **Uphold label** or **Overturn label** (with a field to set a manually-corrected label).
+- **On resolution:** submission `status` changes to `resolved`, the audit log gets a final entry `{ event_type: "appeal_resolved", timestamp, decision, reviewer_note }`, and if overturned, the *displayed* label is updated while the original automated label and score remain visible in the audit trail (full history is preserved, not overwritten).
 
-    subgraph Appeal Flow
-        I[Client] -->|POST /appeal: submission_id, reason| J[Appeal Handler]
-        J -->|lookup| G
-        J -->|status update| G
-        J -->|appeal status| K[Response to Client]
-    end
+---
+
+## 5. Anticipated Edge Cases
+
+1. **A poem or lyrical text with heavy repetition and simple, deliberate vocabulary.** Repetition and simple word choice lower both raw perplexity (predictable words) and raw sentence-length variance (repeated structure), driving both signals toward "AI-like" even though the repetition is an intentional artistic device. Expected result: false "Likely AI-Generated" or "Uncertain" label on a piece of human creative writing.
+
+2. **AI-generated text that has been run through a paraphrasing/"humanizer" tool.** Paraphrasing tools deliberately introduce lexical variety and irregular sentence lengths, which pushes both `perplexity_score` and `burstiness_score` down toward "human-like," even though the underlying content originated from an AI model. Expected result: false "Likely Human" label — a false negative the two chosen signals cannot catch on their own.
+
+3. **Very short submissions (under ~50 words / 2–3 sentences).** Burstiness in particular is a variance measure and is statistically unstable with only one or two sentences to compare — a single long sentence followed by a single short one produces a misleadingly extreme coefficient of variation. Expected result: unstable, low-confidence-in-a-different-sense scores that swing heavily based on a couple of sentences.
+
+4. **Formal/technical human writing (legal boilerplate, academic abstracts, non-native-speaker technical reports).** This style is naturally low-perplexity (precise, conventional vocabulary) and low-burstiness (deliberately uniform, structured sentences) by professional convention, not because it's AI-generated. Expected result: false "Likely AI-Generated," which is the scenario this system's Uncertain band and appeals workflow are specifically designed to catch and correct (see Section 4 of the false-positive walkthrough from Milestone 1).
+
+---
+
+## 6. Architecture
+
+```
+Submission Flow:
+  Client --POST /submit(raw text)--> Ingestion Layer
+    --text--> Signal 1: Perplexity Scorer --perplexity_score-->
+    --text--> Signal 2: Burstiness Analyzer --burstiness_score-->
+  Confidence Scoring (weighted average) --confidence_score-->
+  Transparency Label Generator --label + confidence + signals-->
+    --> Audit Log (write)
+    --> Response to Client
+
+Appeal Flow:
+  Client --POST /appeal(submission_id, reason)--> Appeal Handler
+    --lookup + status update--> Audit Log (append)
+    --> Response to Client (appeal status)
 ```
 
-**Arrow labels, spelled out:**
-- Client → Ingestion Layer: raw submitted text
-- Ingestion Layer → Signal 1 / Signal 2: cleaned/validated text
-- Signal 1 / Signal 2 → Confidence Scoring: individual raw signal scores
-- Confidence Scoring → Label Generator: combined `confidence_score`
-- Label Generator → Audit Log: full decision record (label + confidence + signal breakdown)
-- Label Generator → Response: label + confidence + signal breakdown
-- Client → Appeal Handler: `submission_id` + appeal reason
-- Appeal Handler → Audit Log: lookup of original record, then a new appended status-update entry
-- Appeal Handler → Response: current appeal status
+**Narrative:** A submission flows from ingestion through both detection signals in parallel, into a single weighted confidence score, which is mapped to one of three transparency labels and written to an immutable audit log before being returned to the client. Appeals reuse that same audit log — an appeal never overwrites the original automated decision, it appends a review trail on top of it, and only the reviewer's final resolution changes what label is displayed.
+
+*(This diagram carries forward unchanged from Milestone 1 and is the reference diagram given to AI tools during Milestones 3–5.)*
 
 ---
 
-## Checkpoint Self-Check
+## 7. AI Tool Plan
 
-- ✅ Can describe the path a submitted text takes end to end, naming every component (Section 1).
-- ✅ Two detection signals chosen, each with what it captures and what it misses (Section 2).
-- ✅ Rough API endpoint list defined (Section 4).
-- ✅ Diagram showing both submission and appeal flows, with labeled arrows (Section 5).
+### M3 — Submission endpoint + first signal
+- **Spec sections provided to the AI tool:** Section 1 (Perplexity Score subsection only) + Section 6 (Architecture diagram).
+- **What I'll ask it to generate:** a Flask app skeleton with a `POST /submit` route (accepting `text`, returning `submission_id` + placeholder response), and the standalone `perplexity_score(text)` function.
+- **How I'll verify:** call `perplexity_score()` directly against 3–4 known-human and known-AI text samples *before* wiring it into the endpoint, and confirm the ordering makes sense (known-AI samples score meaningfully higher than known-human samples) before trusting it inside the route.
+
+### M4 — Second signal + confidence scoring
+- **Spec sections provided:** Section 1 (both signals, full) + Section 2 (Uncertainty Representation) + Section 6 (Architecture diagram).
+- **What I'll ask it to generate:** the standalone `burstiness_score(text)` function, plus the `confidence_score(perplexity_score, burstiness_score)` combination function using the documented `w1=0.5, w2=0.5` weights.
+- **How I'll verify:** run the combined pipeline against the same known-human/known-AI sample set from M3 and confirm scores separate meaningfully between the two groups (not clustered together), and check for edge-case failures (e.g. single-sentence input causing a divide-by-zero in the burstiness calculation).
+
+### M5 — Production layer
+- **Spec sections provided:** Section 3 (Transparency Label Design) + Section 4 (Appeals Workflow) + Section 6 (Architecture diagram).
+- **What I'll ask it to generate:** the `generate_label(confidence_score)` function implementing the exact threshold bands and label text from Section 3, and the `POST /appeal` endpoint plus audit log persistence per Section 4.
+- **How I'll verify:** feed `confidence_score` values that straddle each threshold boundary (e.g. `0.20`, `0.34`, `0.35`, `0.50`, `0.65`, `0.66`, `0.90`) and confirm all three label variants are reachable at the correct boundaries; submit a test appeal and confirm the submission's `status` flips to `under_review` and the audit log gets a new appended entry (not an overwrite) via `GET /audit-log/{submission_id}`.
