@@ -1,8 +1,8 @@
 """
 Provenance Guard — Flask app.
 
-Milestone 3 scope: submission endpoint + first detection signal, wired to a
-structured, append-only audit log.
+Milestone 4 scope: two detection signals combined into a single weighted
+confidence score, wired to a structured, append-only audit log.
 """
 
 import os
@@ -13,26 +13,13 @@ from flask import Flask, request, jsonify
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-from signals import signal_1_llm_assessment
+from signal_1_llm import signal_1_score
+from signal_2_stylometric import signal_2_stylometric
+from confidence import combine_signals
 from audit_log import append_entry, get_recent
 
 app = Flask(__name__)
 limiter = Limiter(get_remote_address, app=app, default_limits=["60 per minute"])
-
-# Thresholds from planning.md Section 2 (Uncertainty Representation).
-# Kept as named constants, not magic numbers scattered through the code.
-LIKELY_HUMAN_MAX = 0.34
-UNCERTAIN_MAX = 0.65
-
-
-def label_from_score(score: float) -> str:
-    """Maps a 0-1 score to one of the three attribution bands."""
-    if score <= LIKELY_HUMAN_MAX:
-        return "likely_human"
-    if score <= UNCERTAIN_MAX:
-        return "uncertain"
-    return "likely_ai"
-
 
 @app.route("/submit", methods=["POST"])
 @limiter.limit("20 per minute")
@@ -49,14 +36,12 @@ def submit():
     content_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    signal_1 = signal_1_llm_assessment(text)
-    llm_score = signal_1["llm_score"]
+    signal_1 = signal_1_score(text)
+    signal_2 = signal_2_stylometric(text)
 
-    # Milestone 3: confidence is a placeholder, equal to signal 1's score.
-    # Milestone 4 replaces this with a true weighted combination of both
-    # signals per planning.md Section 1.
-    confidence = llm_score
-    attribution = label_from_score(confidence)
+    combined = combine_signals(signal_1["llm_score"], signal_2["stylometric_score"])
+    confidence = combined["confidence"]
+    attribution = combined["attribution"]
 
     entry = {
         "content_id": content_id,
@@ -64,8 +49,11 @@ def submit():
         "timestamp": timestamp,
         "attribution": attribution,
         "confidence": confidence,
-        "llm_score": llm_score,
+        "llm_score": signal_1["llm_score"],
         "signal_1_source": signal_1["source"],
+        "stylometric_score": signal_2["stylometric_score"],
+        "sentence_length_cv": signal_2["sentence_length_cv"],
+        "type_token_ratio": signal_2["type_token_ratio"],
         "status": "classified",
     }
     append_entry(entry)
@@ -74,6 +62,10 @@ def submit():
         "content_id": content_id,
         "attribution": attribution,
         "confidence": confidence,
+        "signals": {
+            "llm_score": signal_1["llm_score"],
+            "stylometric_score": signal_2["stylometric_score"],
+        },
     }), 201
 
 
